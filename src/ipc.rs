@@ -92,6 +92,10 @@ pub enum IpcResponse {
     StatusOk {
         node_id: String,
         peer_count: usize,
+        file_count: usize,
+        chunk_count: usize,
+        uptime_secs: u64,
+        external_addr: Option<String>,
     },
     Error {
         message: String,

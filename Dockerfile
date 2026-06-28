@@ -7,6 +7,7 @@ COPY tests ./tests
 RUN cargo build --release --locked
 
 FROM alpine:3.21
-RUN apk add --no-cache libgcc
+RUN apk add --no-cache libgcc && adduser -D dstore
 COPY --from=builder /app/target/release/dstore /usr/local/bin/dstore
+USER dstore
 ENTRYPOINT ["dstore"]

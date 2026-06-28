@@ -21,6 +21,22 @@ use tokio::net::UnixListener;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
 
+/// Resolve socket path: use explicit path, or fall back to default if it exists.
+fn try_resolve_socket(socket: Option<PathBuf>) -> Option<PathBuf> {
+    match socket {
+        Some(s) => Some(s),
+        None => {
+            let def = default_socket_path();
+            if def.exists() { Some(def) } else { None }
+        }
+    }
+}
+
+/// Resolve socket path: use explicit path, or always fall back to default.
+fn resolve_socket(socket: Option<PathBuf>) -> PathBuf {
+    socket.unwrap_or_else(default_socket_path)
+}
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -33,6 +49,55 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Init { dir } => {
+            let data_dir = dir.unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join(".dstore")
+            });
+            std::fs::create_dir_all(&data_dir)?;
+            let key_path = data_dir.join("node_key");
+            if !key_path.exists() {
+                let sk = ed25519_dalek::SigningKey::from_bytes(&rand::random::<[u8; 32]>());
+                let pk = sk.verifying_key();
+                std::fs::write(&key_path, hex::encode(sk.to_bytes()))?;
+                println!("Generated node key → {}", key_path.display());
+                println!("Public key: {}", hex::encode(pk.to_bytes()));
+            } else {
+                println!("Node key already exists at {}", key_path.display());
+            }
+            let socket_path = default_socket_path();
+            println!("Data directory: {}", data_dir.display());
+            println!("IPC socket:     {}", socket_path.display());
+            println!();
+            println!("Ready! Start the daemon:");
+            println!("  dstore daemon");
+            println!();
+            println!("Then store files:");
+            println!("  dstore put myfile.txt");
+            println!("  dstore ls");
+        }
+        Command::Status { socket } => {
+            let socket_path = resolve_socket(socket);
+            let req = IpcRequest::Status;
+            match dstor::ipc::send_request(&socket_path, &req).await {
+                Ok(IpcResponse::StatusOk { peer_count, file_count, chunk_count, uptime_secs, node_id, external_addr }) => {
+                    let hours = uptime_secs / 3600;
+                    let mins = (uptime_secs % 3600) / 60;
+                    let secs = uptime_secs % 60;
+                    println!("Node ID: {}", hex::encode(node_id));
+                    if let Some(addr) = external_addr {
+                        println!("Address: {}", addr);
+                    }
+                    println!("Peers:   {}", peer_count);
+                    println!("Files:   {}", file_count);
+                    println!("Chunks:  {}", chunk_count);
+                    println!("Uptime:  {}h {}m {}s", hours, mins, secs);
+                }
+                Ok(IpcResponse::Error { message }) => anyhow::bail!("{}", message),
+                Ok(_) => anyhow::bail!("Unexpected response"),
+                Err(e) => anyhow::bail!("Cannot connect to daemon at {}: {}", socket_path.display(), e),
+            }
+        }
         Command::Store {
             file,
             out,
@@ -49,10 +114,7 @@ async fn main() -> Result<()> {
                 time_cost: argon2_iters,
                 lanes: argon2_lanes,
             };
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            });
+            let socket_path = try_resolve_socket(socket);
 
             if let Some(sock) = socket_path {
                 let req = IpcRequest::Store {
@@ -91,10 +153,7 @@ async fn main() -> Result<()> {
                 time_cost: argon2_iters,
                 lanes: argon2_lanes,
             };
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            });
+            let socket_path = try_resolve_socket(socket);
 
             if let Some(sock) = socket_path {
                 let req = IpcRequest::Get {
@@ -125,10 +184,7 @@ async fn main() -> Result<()> {
                 time_cost: argon2_iters,
                 lanes: argon2_lanes,
             };
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::StoreDir {
                 dir: dir.to_string_lossy().to_string(),
                 passphrase,
@@ -146,10 +202,7 @@ async fn main() -> Result<()> {
                 time_cost: argon2_iters,
                 lanes: argon2_lanes,
             };
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::GetDir {
                 root_hash,
                 output: output.to_string_lossy().to_string(),
@@ -165,10 +218,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Delete { root_hash, socket } => {
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::Delete { root_hash };
             let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
@@ -178,10 +228,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Gc { socket } => {
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::Gc;
             let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
@@ -191,10 +238,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Watch { dir, passphrase, socket, max_file_size, follow_symlinks } => {
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::Watch {
                 dir: dir.to_string_lossy().to_string(),
                 passphrase,
@@ -211,10 +255,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Verify { root_hash, socket } => {
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::Verify { root_hash };
             let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
@@ -231,10 +272,7 @@ async fn main() -> Result<()> {
                 time_cost: argon2_iters,
                 lanes: argon2_lanes,
             };
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::Repair { root_hash, passphrase };
             let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
@@ -246,10 +284,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::List { socket } => {
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            }).context("No daemon socket found (is the daemon running?)")?;
+            let socket_path = resolve_socket(socket);
             let req = IpcRequest::ListFiles;
             let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
@@ -291,10 +326,7 @@ async fn main() -> Result<()> {
                 time_cost: argon2_iters,
                 lanes: argon2_lanes,
             };
-            let socket_path = socket.or_else(|| {
-                let def = default_socket_path();
-                if def.exists() { Some(def) } else { None }
-            });
+            let socket_path = try_resolve_socket(socket);
             if let Some(sock) = socket_path {
                 let req = IpcRequest::ListFiles;
                 if dstor::ipc::send_request(&sock, &req).await.is_ok() {
@@ -470,6 +502,7 @@ async fn main() -> Result<()> {
             std::fs::set_permissions(&ipc_token_path, std::fs::Permissions::from_mode(0o600))?;
             tracing::info!("IPC token saved to: {}", ipc_token_path.display());
 
+            let daemon_start_time = std::time::Instant::now();
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -499,7 +532,7 @@ async fn main() -> Result<()> {
                                 return;
                             }
                             let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
-                                Ok(req) => handle_ipc_request(node, &store, req).await,
+                                Ok(req) => handle_ipc_request(node, &store, req, daemon_start_time).await,
                                 Err(e) => IpcResponse::Error { message: format!("invalid request: {}", e) },
                             };
                             if let Ok(resp_line) = serde_json::to_string(&resp) {
@@ -601,6 +634,7 @@ async fn handle_ipc_request(
     node: Arc<DhtNode>,
     chunk_store: &ChunkStore,
     req: IpcRequest,
+    daemon_start_time: std::time::Instant,
 ) -> IpcResponse {
     match req {
         IpcRequest::Store { file, passphrase } => {
@@ -671,9 +705,20 @@ async fn handle_ipc_request(
         }
         IpcRequest::Status => {
             let peer_count = node.routing.lock().await.all_nodes().len();
+            let file_count = FileIndex::load(chunk_store.dir()).files.len();
+            let chunk_count = match std::fs::read_dir(chunk_store.dir().join("chunks")) {
+                Ok(entries) => entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|ext| ext == "chunk")).count(),
+                Err(_) => 0,
+            };
+            let uptime_secs = daemon_start_time.elapsed().as_secs();
+            let external_addr = node.external_addr().await.map(|a| a.to_string());
             IpcResponse::StatusOk {
                 node_id: hex::encode(node.id),
                 peer_count,
+                file_count,
+                chunk_count,
+                uptime_secs,
+                external_addr,
             }
         }
     }
