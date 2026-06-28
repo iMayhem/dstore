@@ -1,22 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::direct::NotKeyed};
+use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 
 use crate::net::protocol::{
-    generate_node_id, xor_distance, Message, NodeId, NodeInfo, ALPHA, K, MAX_DATAGRAM_SIZE,
+    generate_pow_node_id, xor_distance, Message, NodeId, NodeInfo,
+    SignedMessage, ALPHA, K, MAX_DATAGRAM_SIZE,
 };
 use crate::net::routing::{InsertResult, RoutingTable};
 use crate::net::tcp::TcpMessage;
+
+const MAX_VALUE_SIZE: usize = 1_048_576; // 1 MB
+const MIN_VOTES_FOR_ADDR: usize = 3;
 
 fn msg_tcp_port(msg: &Message) -> u16 {
     match msg {
         Message::Ping { tcp_port, .. } | Message::Pong { tcp_port, .. } => *tcp_port,
         _ => 0,
     }
+}
+
+fn store_rate_limiter() -> &'static RateLimiter<NotKeyed, governor::state::InMemoryState, DefaultClock> {
+    static LIMITER: OnceLock<RateLimiter<NotKeyed, governor::state::InMemoryState, DefaultClock>> = OnceLock::new();
+    LIMITER.get_or_init(|| RateLimiter::direct(Quota::with_period(Duration::from_millis(100)).unwrap()))
 }
 
 pub struct DhtNode {
@@ -26,35 +37,36 @@ pub struct DhtNode {
     store: Arc<Mutex<HashMap<NodeId, Vec<u8>>>>,
     pending_pings: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     external_addr: Arc<Mutex<Option<SocketAddr>>>,
+    addr_votes: Arc<Mutex<HashMap<SocketAddr, HashSet<SocketAddr>>>>,
     punch_callbacks: Arc<Mutex<HashMap<SocketAddr, tokio::sync::oneshot::Sender<SocketAddr>>>>,
     pub tcp_port: u16,
+    signing_key: Arc<ed25519_dalek::SigningKey>,
+    pow_nonce: u64,
 }
 
 impl DhtNode {
-    pub async fn new(addr: SocketAddr) -> std::io::Result<Self> {
+    pub async fn new(
+        addr: SocketAddr,
+        signing_key: ed25519_dalek::SigningKey,
+    ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
-        let id = generate_node_id();
-        tracing::info!("DHT Node ID: {}", hex::encode(id));
+
+        // Generate proof-of-work node ID from the public key
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let (node_id, pow_nonce) = generate_pow_node_id(&pubkey);
+        tracing::info!("DHT Node ID: {} (PoW difficulty: {} bits)", hex::encode(node_id), crate::net::protocol::POW_DIFFICULTY);
         tracing::info!("UDP listening on: {}", local_addr);
 
-        // Bind TCP on port+1, try up to 100 ports in case of conflict
-        let mut tcp_port = local_addr.port();
-        let tcp_listener = loop {
-            tcp_port += 1;
-            let tcp_addr = SocketAddr::new(local_addr.ip(), tcp_port);
-            match TcpListener::bind(tcp_addr).await {
-                Ok(listener) => {
-                    tracing::info!("TCP listening on: {}", tcp_addr);
-                    break listener;
-                }
-                Err(_) if tcp_port < local_addr.port() + 100 => continue,
-                Err(e) => return Err(e),
-            }
-        };
+        // Bind TCP on random port (port 0 for OS assignment)
+        let tcp_addr = SocketAddr::new(local_addr.ip(), 0);
+        let tcp_listener = TcpListener::bind(tcp_addr).await?;
+        let actual = tcp_listener.local_addr().unwrap();
+        tracing::info!("TCP listening on: {}", actual);
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
 
-        let mut routing = RoutingTable::new(id);
-        routing.insert(id, local_addr, tcp_port);
+        let mut routing = RoutingTable::new(node_id);
+        routing.insert(node_id, local_addr, tcp_port);
         let store: Arc<Mutex<HashMap<NodeId, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
 
         // Spawn TCP acceptor
@@ -64,14 +76,17 @@ impl DhtNode {
         });
 
         Ok(DhtNode {
-            id,
+            id: node_id,
             routing: Arc::new(Mutex::new(routing)),
             socket: Arc::new(socket),
             store,
             pending_pings: Arc::new(Mutex::new(HashMap::new())),
             external_addr: Arc::new(Mutex::new(None)),
+            addr_votes: Arc::new(Mutex::new(HashMap::new())),
             punch_callbacks: Arc::new(Mutex::new(HashMap::new())),
             tcp_port,
+            signing_key: Arc::new(signing_key),
+            pow_nonce,
         })
     }
 
@@ -88,9 +103,18 @@ impl DhtNode {
         let resp = self.send_rpc_expect(&msg, relay).await?;
         match resp {
             Message::FindAddrOk { addr, .. } => {
-                let mut ea = self.external_addr.lock().await;
-                *ea = Some(addr);
-                tracing::info!("Discovered external address: {}", addr);
+                // Multi-peer confirmation: vote tracking
+                let mut votes = self.addr_votes.lock().await;
+                let entry = votes.entry(addr).or_default();
+                entry.insert(relay);
+                if entry.len() >= MIN_VOTES_FOR_ADDR {
+                    let mut ea = self.external_addr.lock().await;
+                    *ea = Some(addr);
+                    tracing::info!("Discovered external address (confirmed by {} peers): {}", entry.len(), addr);
+                    votes.clear();
+                } else {
+                    tracing::debug!("Address {} suggested by peer (votes: {}/{})", addr, entry.len(), MIN_VOTES_FOR_ADDR);
+                }
                 Ok(addr)
             }
             _ => anyhow::bail!("Unexpected response to FindAddr"),
@@ -110,13 +134,16 @@ impl DhtNode {
             target_id,
             target_addr,
         };
-        let data = bincode::serialize(&msg)?;
+        let signed = SignedMessage::sign(&self.signing_key, msg, self.pow_nonce)?;
+        let data = bincode::serialize(&signed)?;
         self.socket.send_to(&data, relay).await?;
 
         // Send a blind packet to start opening our NAT to the target
         let blind = Message::Ping { id: self.id, tcp_port: self.tcp_port };
-        if let Ok(data) = bincode::serialize(&blind) {
-            self.socket.send_to(&data, target_addr).await.ok();
+        if let Ok(signed) = SignedMessage::sign(&self.signing_key, blind, self.pow_nonce) {
+            if let Ok(data) = bincode::serialize(&signed) {
+                self.socket.send_to(&data, target_addr).await.ok();
+            }
         }
 
         // Read until we get a message from the target (proving the pinhole is open)
@@ -128,9 +155,11 @@ impl DhtNode {
                     return Ok::<_, anyhow::Error>(from);
                 }
                 // Still process other messages for routing
-                if let Ok(msg) = bincode::deserialize::<Message>(&buf[..len]) {
-                    if let Some(id) = msg.sender_id() {
-                        self.routing.lock().await.insert(id, from, msg_tcp_port(&msg));
+                if let Ok(signed) = bincode::deserialize::<SignedMessage>(&buf[..len]) {
+                    if let Ok(msg) = signed.verify() {
+                        if let Some(id) = msg.sender_id() {
+                            self.routing.lock().await.insert(id, from, msg_tcp_port(&msg));
+                        }
                     }
                 }
             }
@@ -150,15 +179,18 @@ impl DhtNode {
         tracing::info!("Bootstrapping with {}", bootstrap_addr);
         let mut buf = vec![0u8; 65535];
         let msg = Message::Ping { id: self.id, tcp_port: self.tcp_port };
-        let data = bincode::serialize(&msg)?;
+        let signed = SignedMessage::sign(&self.signing_key, msg, self.pow_nonce)?;
+        let data = bincode::serialize(&signed)?;
         self.socket.send_to(&data, bootstrap_addr).await?;
 
         match tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (len, from) = self.socket.recv_from(&mut buf).await?;
                 if from == bootstrap_addr {
-                    if let Ok(msg) = bincode::deserialize::<Message>(&buf[..len]) {
-                        return Ok::<_, anyhow::Error>(msg);
+                    if let Ok(signed) = bincode::deserialize::<SignedMessage>(&buf[..len]) {
+                        if let Ok(msg) = signed.verify() {
+                            return Ok::<_, anyhow::Error>(msg);
+                        }
                     }
                 }
             }
@@ -188,6 +220,8 @@ impl DhtNode {
     pub async fn run(&self) -> anyhow::Result<()> {
         let local_tcp_port = self.tcp_port;
         let local_addr = self.socket.local_addr()?;
+        let signing_key = self.signing_key.clone();
+        let pow_nonce = self.pow_nonce;
         let mut buf = vec![0u8; 65535];
         loop {
             let (len, from) = self.socket.recv_from(&mut buf).await?;
@@ -198,18 +232,28 @@ impl DhtNode {
             let local_id = self.id;
             let pending_pings = self.pending_pings.clone();
             let external_addr = self.external_addr.clone();
+            let addr_votes = self.addr_votes.clone();
             let punch_callbacks = self.punch_callbacks.clone();
+            let sk = signing_key.clone();
 
             tokio::spawn(async move {
-                if let Ok(msg) = bincode::deserialize::<Message>(&data) {
-                    tracing::debug!("Received message from {}: {:?}", from, msg);
-                    if let Err(e) = Self::handle_message(
-                        socket, routing, store, local_id, local_addr, local_tcp_port,
-                        pending_pings, external_addr, punch_callbacks, msg, from,
-                    )
-                    .await
-                    {
-                        tracing::warn!("Error handling message from {}: {}", from, e);
+                if let Ok(signed) = bincode::deserialize::<SignedMessage>(&data) {
+                    match signed.verify() {
+                        Ok(msg) => {
+                            tracing::debug!("Received message from {}: {:?}", from, msg);
+                            if let Err(e) = Self::handle_message(
+                                socket, routing, store, local_id, local_addr, local_tcp_port,
+                                pending_pings, external_addr, addr_votes, punch_callbacks,
+                                msg, from, &sk, pow_nonce,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Error handling message from {}: {}", from, e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Signature verification failed from {}: {}", from, e);
+                        }
                     }
                 }
             });
@@ -241,7 +285,7 @@ impl DhtNode {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 1024 * 1024 {
+        if len > MAX_VALUE_SIZE {
             anyhow::bail!("TCP message too large: {} bytes", len);
         }
         let mut buf = vec![0u8; len];
@@ -250,6 +294,9 @@ impl DhtNode {
 
         match msg {
             TcpMessage::PutChunk { key, data } => {
+                if data.len() > MAX_VALUE_SIZE {
+                    anyhow::bail!("chunk data too large: {} bytes", data.len());
+                }
                 store.lock().await.insert(key, data);
                 let resp = TcpMessage::PutChunkOk { key };
                 Self::send_tcp_message(&mut stream, &resp).await?;
@@ -290,7 +337,7 @@ impl DhtNode {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 1024 * 1024 {
+        if len > MAX_VALUE_SIZE {
             anyhow::bail!("TCP response too large: {} bytes", len);
         }
         let mut buf = vec![0u8; len];
@@ -298,7 +345,6 @@ impl DhtNode {
         Ok(bincode::deserialize(&buf)?)
     }
 
-    /// Send a chunk to a remote node's TCP port. Used internally by store_value.
     async fn put_chunk_tcp(
         &self,
         addr: SocketAddr,
@@ -328,7 +374,6 @@ impl DhtNode {
         }
     }
 
-    /// Fetch a chunk from a remote node's TCP port. Used internally by find_value.
     async fn get_chunk_tcp(
         &self,
         addr: SocketAddr,
@@ -370,14 +415,15 @@ impl DhtNode {
         local_tcp_port: u16,
         pending_pings: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
         external_addr: Arc<Mutex<Option<SocketAddr>>>,
+        addr_votes: Arc<Mutex<HashMap<SocketAddr, HashSet<SocketAddr>>>>,
         punch_callbacks: Arc<Mutex<HashMap<SocketAddr, tokio::sync::oneshot::Sender<SocketAddr>>>>,
         msg: Message,
         from: SocketAddr,
+        signing_key: &ed25519_dalek::SigningKey,
+        pow_nonce: u64,
     ) -> anyhow::Result<()> {
-        // Determine TCP port to use for this peer based on the message type
         let peer_tcp_port = msg_tcp_port(&msg);
 
-        // Update routing table for any message from a known node
         match &msg {
             Message::Ping { id, .. }
             | Message::Pong { id, .. }
@@ -398,17 +444,18 @@ impl DhtNode {
                     drop(rt);
                     if let Some(oldest) = oldest {
                         let ping_msg = Message::Ping { id: local_id, tcp_port: local_tcp_port };
-                        if let Ok(data) = bincode::serialize(&ping_msg) {
-                            socket.send_to(&data, oldest.addr).await.ok();
-                            let mut pp = pending_pings.lock().await;
-                            pp.insert(oldest.addr, Instant::now());
+                        if let Ok(signed) = SignedMessage::sign(signing_key, ping_msg, pow_nonce) {
+                            if let Ok(data) = bincode::serialize(&signed) {
+                                socket.send_to(&data, oldest.addr).await.ok();
+                                let mut pp = pending_pings.lock().await;
+                                pp.insert(oldest.addr, Instant::now());
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Check if this message completes a pending hole punch
         {
             let mut cbs = punch_callbacks.lock().await;
             if let Some(tx) = cbs.remove(&from) {
@@ -419,7 +466,8 @@ impl DhtNode {
         match msg {
             Message::Ping { id: _, tcp_port: _ } => {
                 let pong = Message::Pong { id: local_id, tcp_port: local_tcp_port };
-                let data = bincode::serialize(&pong)?;
+                let signed = SignedMessage::sign(signing_key, pong, pow_nonce)?;
+                let data = bincode::serialize(&signed)?;
                 socket.send_to(&data, from).await?;
             }
             Message::Pong { id: _, tcp_port: _ } => {
@@ -427,17 +475,25 @@ impl DhtNode {
                 pp.remove(&from);
             }
             Message::Store { id: _, key, value } => {
+                if value.len() > MAX_VALUE_SIZE {
+                    tracing::warn!("Rejected oversized Store from {} ({} bytes)", from, value.len());
+                    return Ok(());
+                }
+                if store_rate_limiter().check().is_err() {
+                    tracing::warn!("Rate limit exceeded for Store from {}", from);
+                    return Ok(());
+                }
                 let mut s = store.lock().await;
                 s.insert(key, value);
                 let ok = Message::StoreOk { id: local_id, key };
-                let data = bincode::serialize(&ok)?;
+                let signed = SignedMessage::sign(signing_key, ok, pow_nonce)?;
+                let data = bincode::serialize(&signed)?;
                 socket.send_to(&data, from).await?;
             }
             Message::StoreOk { .. } => {}
             Message::FindNode { id: _, target } => {
                 let rt = routing.lock().await;
                 let mut nodes = rt.closest(&target, K);
-                // Include self so requester learns our TCP port
                 nodes.push(NodeInfo {
                     id: local_id,
                     addr: local_addr,
@@ -448,14 +504,13 @@ impl DhtNode {
                     id: local_id,
                     nodes,
                 };
-                let data = bincode::serialize(&resp)?;
+                let signed = SignedMessage::sign(signing_key, resp, pow_nonce)?;
+                let data = bincode::serialize(&signed)?;
                 socket.send_to(&data, from).await?;
             }
             Message::FindNodeOk { .. } => {}
             Message::FindValue { id: _, key } => {
                 let s = store.lock().await;
-                // Don't return values over UDP that exceed MAX_DATAGRAM_SIZE.
-                // The requester falls back to TCP GetChunk for large values.
                 let value = s.get(&key).and_then(|v| {
                     if v.len() <= MAX_DATAGRAM_SIZE {
                         Some(v.clone())
@@ -472,40 +527,49 @@ impl DhtNode {
                     value,
                     nodes,
                 };
-                let data = bincode::serialize(&resp)?;
+                let signed = SignedMessage::sign(signing_key, resp, pow_nonce)?;
+                let data = bincode::serialize(&signed)?;
                 socket.send_to(&data, from).await?;
             }
             Message::FindValueOk { .. } => {}
-            // NAT traversal — address discovery
             Message::FindAddr { id: _ } => {
                 let resp = Message::FindAddrOk { id: local_id, addr: from };
-                let data = bincode::serialize(&resp)?;
+                let signed = SignedMessage::sign(signing_key, resp, pow_nonce)?;
+                let data = bincode::serialize(&signed)?;
                 socket.send_to(&data, from).await?;
             }
             Message::FindAddrOk { addr, .. } => {
-                let mut ea = external_addr.lock().await;
-                *ea = Some(addr);
-                tracing::debug!("Discovered external address: {}", addr);
+                let mut votes = addr_votes.lock().await;
+                let entry = votes.entry(addr).or_default();
+                entry.insert(from);
+                if entry.len() >= MIN_VOTES_FOR_ADDR {
+                    let mut ea = external_addr.lock().await;
+                    *ea = Some(addr);
+                    tracing::debug!("External address confirmed by {} peers: {}", entry.len(), addr);
+                    votes.clear();
+                }
             }
-            // NAT traversal — hole punching
             Message::HolePunch { target_id: _, target_addr, .. } => {
-                // We are the relay. Notify the target that someone wants to connect.
                 let notify = Message::HolePunchNotify {
                     source_id: local_id,
                     source_addr: from,
                 };
-                if let Ok(data) = bincode::serialize(&notify) {
-                    socket.send_to(&data, target_addr).await.ok();
+                if let Ok(signed) = SignedMessage::sign(signing_key, notify, pow_nonce) {
+                    if let Ok(data) = bincode::serialize(&signed) {
+                        socket.send_to(&data, target_addr).await.ok();
+                    }
                 }
                 let ok = Message::HolePunchOk { id: local_id };
-                let data = bincode::serialize(&ok)?;
+                let signed = SignedMessage::sign(signing_key, ok, pow_nonce)?;
+                let data = bincode::serialize(&signed)?;
                 socket.send_to(&data, from).await?;
             }
             Message::HolePunchNotify { source_addr, .. } => {
-                // Someone wants us to hole-punch. Send a packet to open our NAT.
                 let blind = Message::Ping { id: local_id, tcp_port: local_tcp_port };
-                if let Ok(data) = bincode::serialize(&blind) {
-                    socket.send_to(&data, source_addr).await.ok();
+                if let Ok(signed) = SignedMessage::sign(signing_key, blind, pow_nonce) {
+                    if let Ok(data) = bincode::serialize(&signed) {
+                        socket.send_to(&data, source_addr).await.ok();
+                    }
                 }
             }
             Message::HolePunchOk { .. } => {}
@@ -515,7 +579,8 @@ impl DhtNode {
     }
 
     async fn send_rpc(&self, msg: &Message, target: SocketAddr) -> anyhow::Result<Vec<u8>> {
-        let data = bincode::serialize(msg)?;
+        let signed = SignedMessage::sign(&self.signing_key, msg.clone(), self.pow_nonce)?;
+        let data = bincode::serialize(&signed)?;
         let mut buf = vec![0u8; 65535];
         self.socket.send_to(&data, target).await?;
         let (len, from) =
@@ -523,7 +588,9 @@ impl DhtNode {
         if from != target {
             anyhow::bail!("Response from unexpected address: {}", from);
         }
-        Ok(buf[..len].to_vec())
+        let resp_signed: SignedMessage = bincode::deserialize(&buf[..len])?;
+        resp_signed.verify()?;
+        Ok(bincode::serialize(&resp_signed.inner)?)
     }
 
     async fn send_rpc_expect(&self, msg: &Message, target: SocketAddr) -> anyhow::Result<Message> {
@@ -630,8 +697,6 @@ impl DhtNode {
         Ok(())
     }
 
-    /// Check how many of the K closest peers actually have a copy of the value.
-    /// Returns the list of peers that confirmed they have it.
     pub async fn check_replicas(&self, key: &NodeId) -> Vec<NodeInfo> {
         let nodes = {
             let rt = self.routing.lock().await;
@@ -644,7 +709,6 @@ impl DhtNode {
                 replicas.push(node.clone());
                 continue;
             }
-            // Try UDP FindValue first (works for small values)
             let msg = Message::FindValue { id: self.id, key: *key };
             if let Ok(Message::FindValueOk { value: Some(_), .. }) =
                 self.send_rpc_expect(&msg, node.addr).await
@@ -652,7 +716,6 @@ impl DhtNode {
                 replicas.push(node.clone());
                 continue;
             }
-            // Fall back to TCP GetChunk for large values
             if node.tcp_port != 0 {
                 if let Ok(Some(_)) = self.get_chunk_tcp(node.addr, node.tcp_port, key).await {
                     replicas.push(node.clone());
@@ -662,9 +725,6 @@ impl DhtNode {
         replicas
     }
 
-    /// Ensure a value has at least `target_count` replicas among the network.
-    /// Checks peers for existing copies, then distributes to peers that don't have it.
-    /// Returns the total number of confirmed replicas (including self).
     pub async fn replicate_value(
         &self,
         key: NodeId,
@@ -682,7 +742,7 @@ impl DhtNode {
         };
 
         let use_tcp = value.len() > MAX_DATAGRAM_SIZE;
-        let mut stored = 1usize; // we have it locally
+        let mut stored = 1usize;
 
         for node in &nodes {
             if stored >= target_count {
@@ -692,7 +752,6 @@ impl DhtNode {
                 continue;
             }
 
-            // Check if peer already has it
             let has_it = if use_tcp {
                 if node.tcp_port == 0 {
                     false
@@ -715,7 +774,6 @@ impl DhtNode {
                 continue;
             }
 
-            // Peer doesn't have it — send the value
             let ok = if use_tcp {
                 self.put_chunk_tcp(node.addr, node.tcp_port, key, &value)
                     .await
@@ -747,13 +805,13 @@ impl DhtNode {
         stored
     }
 
-    /// Spawn a background task that periodically refreshes buckets and re-publishes values.
-    /// Call this once after bootstrapping if the node will run for a while.
     pub fn start_repair_task(&self) {
         let routing = self.routing.clone();
         let store = self.store.clone();
         let socket = self.socket.clone();
         let local_id = self.id;
+        let signing_key = self.signing_key.clone();
+        let pow_nonce = self.pow_nonce;
 
         tokio::spawn(async move {
             let mut bucket_idx = 0usize;
@@ -761,10 +819,8 @@ impl DhtNode {
             loop {
                 interval.tick().await;
 
-                // 1. Refresh a bucket by doing a random lookup in its range
                 let target = {
                     let mut id = local_id;
-                    // Flip a random bit in the bucket's range
                     let bit_index = 255 - bucket_idx;
                     if bit_index < 256 {
                         let byte_idx = bit_index / 8;
@@ -776,8 +832,6 @@ impl DhtNode {
 
                 tracing::debug!("Refreshing bucket {} via lookup", bucket_idx);
 
-                // We can't call self.node_lookup here because we're in a spawned task
-                // Instead, send a FindNode manually to a known node
                 let target_closest = {
                     let rt = routing.lock().await;
                     rt.closest(&target, K).first().cloned()
@@ -788,19 +842,23 @@ impl DhtNode {
                         id: local_id,
                         target,
                     };
-                    if let Ok(data) = bincode::serialize(&msg) {
-                        let mut buf = vec![0u8; 65535];
-                        if socket.send_to(&data, closest.addr).await.is_ok() {
-                            if let Ok(Ok((len, _))) = tokio::time::timeout(
-                                Duration::from_secs(3),
-                                socket.recv_from(&mut buf),
-                            )
-                            .await
-                            {
-                                if let Ok(Message::FindNodeOk { nodes, .. }) = bincode::deserialize::<Message>(&buf[..len]) {
-                                    let mut rt = routing.lock().await;
-                                    for n in nodes {
-                                        rt.insert(n.id, n.addr, n.tcp_port);
+                        if let Ok(signed) = SignedMessage::sign(&signing_key, msg, pow_nonce) {
+                        if let Ok(data) = bincode::serialize(&signed) {
+                            let mut buf = vec![0u8; 65535];
+                            if socket.send_to(&data, closest.addr).await.is_ok() {
+                                if let Ok(Ok((len, _))) = tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    socket.recv_from(&mut buf),
+                                )
+                                .await
+                                {
+                                    if let Ok(resp_signed) = bincode::deserialize::<SignedMessage>(&buf[..len]) {
+                                        if let Ok(Message::FindNodeOk { nodes, .. }) = resp_signed.verify() {
+                                            let mut rt = routing.lock().await;
+                                            for n in nodes {
+                                                rt.insert(n.id, n.addr, n.tcp_port);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -810,7 +868,6 @@ impl DhtNode {
 
                 bucket_idx = (bucket_idx + 1) % 256;
 
-                // 2. Every 5th tick (roughly every 150s), verify + replenish replicas
                 if bucket_idx.is_multiple_of(5) {
                     let snapshot = {
                         let s = store.lock().await;
@@ -829,8 +886,7 @@ impl DhtNode {
                                 rt.closest(key, K)
                             };
 
-                            // First check which nodes already have it, count replicas
-                            let mut have_count = 1usize; // self
+                            let mut have_count = 1usize;
                             let mut missing: Vec<&NodeInfo> = Vec::new();
 
                             for node in &nodes {
@@ -874,7 +930,7 @@ impl DhtNode {
                                         key: *key,
                                     };
                                     matches!(
-                                        Self::send_rpc_raw(&msg, node.addr, &socket).await,
+                                        Self::send_rpc_raw(&msg, node.addr, &socket, &signing_key, pow_nonce).await,
                                         Ok(Message::FindValueOk {
                                             value: Some(_), ..
                                         })
@@ -888,7 +944,6 @@ impl DhtNode {
                                 }
                             }
 
-                            // Replicate to peers that don't have it, up to target
                             if have_count < target {
                                 let use_tcp = value.len() > MAX_DATAGRAM_SIZE;
                                 for node in &missing {
@@ -926,7 +981,7 @@ impl DhtNode {
                                             value: value.clone(),
                                         };
                                         matches!(
-                                            Self::send_rpc_raw(&msg, node.addr, &socket).await,
+                                            Self::send_rpc_raw(&msg, node.addr, &socket, &signing_key, pow_nonce).await,
                                             Ok(Message::StoreOk { .. })
                                         )
                                     };
@@ -951,13 +1006,15 @@ impl DhtNode {
         });
     }
 
-    /// Send an RPC and deserialize the response, using a raw socket (for spawned tasks).
     async fn send_rpc_raw(
         msg: &Message,
         target: SocketAddr,
         socket: &UdpSocket,
+        signing_key: &ed25519_dalek::SigningKey,
+        pow_nonce: u64,
     ) -> anyhow::Result<Message> {
-        let data = bincode::serialize(msg)?;
+        let signed = SignedMessage::sign(signing_key, msg.clone(), pow_nonce)?;
+        let data = bincode::serialize(&signed)?;
         let mut buf = vec![0u8; 65535];
         socket.send_to(&data, target).await?;
         let (len, from) =
@@ -965,7 +1022,9 @@ impl DhtNode {
         if from != target {
             anyhow::bail!("Response from unexpected address: {}", from);
         }
-        Ok(bincode::deserialize(&buf[..len])?)
+        let resp_signed: SignedMessage = bincode::deserialize(&buf[..len])?;
+        resp_signed.verify()?;
+        Ok(resp_signed.inner)
     }
 
     pub async fn find_value(&self, key: &NodeId) -> anyhow::Result<Option<Vec<u8>>> {
@@ -978,12 +1037,10 @@ impl DhtNode {
 
         let nodes = self.node_lookup(*key).await?;
         for node in &nodes {
-            // Try UDP first (works for small values)
             let msg = Message::FindValue { id: self.id, key: *key };
             if let Ok(Message::FindValueOk { value: Some(v), .. }) = self.send_rpc_expect(&msg, node.addr).await {
                 return Ok(Some(v));
             }
-            // If UDP didn't find it, try TCP (for large values)
             if node.tcp_port != 0 {
                 if let Ok(Some(v)) = self.get_chunk_tcp(node.addr, node.tcp_port, key).await {
                     return Ok(Some(v));

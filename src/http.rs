@@ -1,19 +1,27 @@
-use crate::crypto::{decrypt_chunk, EncryptedChunk};
+use crate::crypto::{decrypt_chunk, keyed_content_address, EncryptedChunk};
 use crate::net::dht::DhtNode;
 use crate::store::{ChunkStore, FileIndex};
-use sha2::{Digest, Sha256};
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
+
+pub struct TlsConfig {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+}
 
 pub struct HttpState {
     pub node: Arc<DhtNode>,
     pub store_dir: PathBuf,
     pub encryption_key: Option<Arc<Zeroizing<[u8; 32]>>>,
     pub start_time: Instant,
+    pub auth_token: Option<String>,
+    pub tls_config: Option<TlsConfig>,
 }
 
 pub async fn run_http_server(state: Arc<HttpState>, bind_addr: &str) {
@@ -45,6 +53,16 @@ pub async fn run_http_server(state: Arc<HttpState>, bind_addr: &str) {
     }
 }
 
+fn extract_bearer_token(request: &str) -> Option<&str> {
+    for line in request.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("authorization: bearer ") {
+            return Some(line.trim_start_matches(|c: char| !c.is_whitespace()).trim());
+        }
+    }
+    None
+}
+
 pub async fn handle_connection(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>) -> std::io::Result<()> {
     let mut buf = vec![0u8; 16384];
     let n = stream.read(&mut buf).await?;
@@ -54,6 +72,21 @@ pub async fn handle_connection(stream: &mut tokio::net::TcpStream, state: Arc<Ht
 
     let raw = &buf[..n];
     let request = String::from_utf8_lossy(raw);
+
+    // Token auth check
+    if let Some(ref expected_token) = state.auth_token {
+        let provided = extract_bearer_token(&request).unwrap_or("");
+        if expected_token.as_bytes().ct_eq(provided.as_bytes()).unwrap_u8() != 1 {
+            let body = "401 Unauthorized";
+            let header = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nWWW-Authenticate: Bearer\r\nConnection: close\r\n\r\n",
+                body.len(),
+            );
+            stream.write_all(header.as_bytes()).await?;
+            stream.write_all(body.as_bytes()).await?;
+            return Ok(());
+        }
+    }
 
     if request.starts_with("GET /status") {
         let body = status_json(&state);
@@ -89,7 +122,7 @@ async fn handle_delete(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>
     if file_index.files.len() == before {
         return write_error(stream, 404, "File not found in index").await;
     }
-    file_index.save(&state.store_dir).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    file_index.save(&state.store_dir).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Delete chunk files from disk (best-effort, by pattern matching hash prefix)
     if let Ok(entries) = std::fs::read_dir(state.store_dir.join("chunks")) {
@@ -147,7 +180,6 @@ async fn serve_file(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>, r
         _ => return write_error(stream, 400, "Invalid root hash").await,
     };
 
-    // Fetch manifest from DHT
     let manifest_bytes = match state.node.find_value(&manifest_key).await {
         Ok(Some(b)) => b,
         Ok(None) => return write_error(stream, 404, "File not found").await,
@@ -159,13 +191,11 @@ async fn serve_file(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>, r
         Err(_) => return write_error(stream, 500, "Invalid manifest").await,
     };
 
-    // Check if encryption is needed but key not available
     let needs_key = manifest.chunks.iter().any(|c| c.nonce.is_some());
     if needs_key && state.encryption_key.is_none() {
         return write_error(stream, 401, "File is encrypted. Restart daemon with --passphrase.").await;
     }
 
-    // Check if all chunks are local; if not, fetch them
     let store = ChunkStore::new(state.store_dir.join("chunks"));
     let mut missing = Vec::new();
     for info in &manifest.chunks {
@@ -184,8 +214,7 @@ async fn serve_file(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>, r
                 _ => continue,
             };
             if let Ok(Some(data)) = state.node.find_value(&chunk_key).await {
-                // Verify integrity
-                let actual_hash = hex::encode(Sha256::digest(&data));
+                let actual_hash = keyed_content_address(&data, state.encryption_key.as_deref());
                 if actual_hash == *hash {
                     store.store_chunk(hash, &data).ok();
                 }
@@ -193,7 +222,6 @@ async fn serve_file(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>, r
         }
     }
 
-    // Reassemble into memory
     let mut file_data = Vec::new();
     for info in &manifest.chunks {
         match store.load_chunk(&info.hash) {
@@ -222,7 +250,6 @@ async fn serve_file(stream: &mut tokio::net::TcpStream, state: Arc<HttpState>, r
             }
         }
 
-    // Restore original file size (last chunk may have padding)
     file_data.truncate(manifest.file_size as usize);
 
     let content_type = guess_mime(&manifest.file_name);
@@ -439,21 +466,16 @@ h2{{font-size:1.12em;font-weight:900;margin:2rem 0 .5rem}}
   // Auto-refresh peers+files every 5s
   setInterval(function(){{
     fetch('/status').then(function(r){{return r.json()}}).then(function(d){{
-      // Update peer count
       var pc=document.getElementById('peer-count');
       if(pc)pc.textContent=d.peer_count;
-      // Update file count
       var fc=document.getElementById('file-count');
       if(fc)fc.textContent=d.files.length;
-      // Update peers
       var pl=document.getElementById('peer-list');
       if(pl&&d.peers.length>0){{
         pl.innerHTML=d.peers.map(function(p){{return '<div class=\"peer\"><code data-copy=\"'+p.id+'\">'+p.id.slice(0,16)+'</code><span class=\"addr\">'+p.addr+':'+p.tcp_port+'</span></div>'}}).join('');
       }}
-      // Update chunks count
       var cc=document.getElementById('chunk-count');
       if(cc)cc.textContent=d.chunk_count;
-      // Update uptime
       var up=document.getElementById('uptime-display');
       if(up){{
         var s=d.uptime_secs;

@@ -1,5 +1,5 @@
 [package]
-name = "dstore"
+name = "dstor"
 version = "0.1.0"
 edition = "2021"
 description = "Decentralized file storage over Kademlia DHT with erasure coding, encryption, and NAT traversal"
@@ -25,4 +25,15 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 dirs = "5"
 reed-solomon-erasure = "6.0"
 notify = { version = "7", features = ["macos_fsevent"] }
-# fuser requires libfuse3-dev (system package) — falls back to HTTP file serving
+rpassword = "7"
+governor = "0.6"
+subtle = "2"
+hmac = "0.12"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+fuser = { version = "0.15", optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = []
+fuse = ["fuser", "libc"]

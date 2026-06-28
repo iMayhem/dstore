@@ -6,3 +6,6 @@ pub mod crypto;
 pub mod erasure;
 pub mod http;
 pub mod ipc;
+
+#[cfg(feature = "fuse")]
+pub mod fuse;

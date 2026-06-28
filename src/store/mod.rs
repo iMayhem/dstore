@@ -94,4 +94,22 @@ impl ChunkStore {
         std::fs::write(self.dir.join("root_hash"), hash)?;
         Ok(())
     }
+
+    pub fn list_all_chunks(&self) -> Result<Vec<String>> {
+        let chunks_dir = self.dir.join("chunks");
+        if !chunks_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut hashes = Vec::new();
+        for entry in std::fs::read_dir(&chunks_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "chunk") {
+                if let Some(stem) = path.file_stem() {
+                    hashes.push(stem.to_string_lossy().to_string());
+                }
+            }
+        }
+        Ok(hashes)
+    }
 }

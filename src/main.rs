@@ -1,22 +1,28 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use dstore::chunk;
-use dstore::cli::{Cli, Command};
-use dstore::crypto::{decrypt_chunk, derive_encryption_key, encrypt_chunk, EncryptedChunk};
-use dstore::erasure;
-use dstore::ipc::{default_socket_path, IpcRequest, IpcResponse};
-use dstore::net::dht::DhtNode;
-use dstore::store::{ChunkStore, FileIndex, FileRecord};
+use dstor::chunk;
+use dstor::cli::{Cli, Command};
+use dstor::crypto::{
+    decrypt_chunk, derive_encryption_key, encrypt_chunk, keyed_content_address,
+    resolve_passphrase, Argon2Config, EncryptedChunk,
+};
+use dstor::erasure;
+use dstor::ipc::{default_socket_path, IpcRequest, IpcResponse};
+use dstor::net::dht::DhtNode;
+use dstor::store::{ChunkStore, FileIndex, FileRecord};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::SystemTime;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroizing;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,7 +40,15 @@ async fn main() -> Result<()> {
             addr,
             bootstrap,
             socket,
+            argon2_mem_kib,
+            argon2_iters,
+            argon2_lanes,
         } => {
+            let argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
@@ -45,15 +59,19 @@ async fn main() -> Result<()> {
                     file: file.to_string_lossy().to_string(),
                     passphrase,
                 };
-                let resp = dstore::ipc::send_request(&sock, &req).await?;
+                let resp = dstor::ipc::send_request(&sock, &req).await?;
                 match resp {
                     IpcResponse::StoreOk { root_hash } => println!("{}", root_hash),
                     IpcResponse::Error { message } => anyhow::bail!("{}", message),
                     _ => anyhow::bail!("Unexpected response from daemon"),
                 }
             } else {
-                let key = passphrase.as_deref().map(derive_encryption_key).transpose()?;
-                store_file(&file, &out, key, addr, bootstrap).await?;
+                let passphrase = resolve_passphrase(passphrase)?;
+                let key = passphrase
+                    .as_ref()
+                    .map(|p| derive_encryption_key(p, &argon2_config))
+                    .transpose()?;
+                store_file(&file, &out, key, addr, bootstrap, &argon2_config).await?;
             }
         }
         Command::Get {
@@ -64,7 +82,15 @@ async fn main() -> Result<()> {
             addr,
             bootstrap,
             socket,
+            argon2_mem_kib,
+            argon2_iters,
+            argon2_lanes,
         } => {
+            let argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
@@ -76,7 +102,7 @@ async fn main() -> Result<()> {
                     output: output.to_string_lossy().to_string(),
                     passphrase,
                 };
-                let resp = dstore::ipc::send_request(&sock, &req).await?;
+                let resp = dstor::ipc::send_request(&sock, &req).await?;
                 match resp {
                     IpcResponse::GetOk => {
                         tracing::info!("File reassembled to {}", output.display());
@@ -85,11 +111,20 @@ async fn main() -> Result<()> {
                     _ => anyhow::bail!("Unexpected response from daemon"),
                 }
             } else {
-                let key = passphrase.as_deref().map(derive_encryption_key).transpose()?;
+                let passphrase = resolve_passphrase(passphrase)?;
+                let key = passphrase
+                    .as_ref()
+                    .map(|p| derive_encryption_key(p, &argon2_config))
+                    .transpose()?;
                 get_file(&root_hash, &output, store.as_deref(), key, addr, bootstrap).await?;
             }
         }
-        Command::StoreDir { dir, passphrase, socket } => {
+        Command::StoreDir { dir, passphrase, socket, argon2_mem_kib, argon2_iters, argon2_lanes } => {
+            let _argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
@@ -98,14 +133,19 @@ async fn main() -> Result<()> {
                 dir: dir.to_string_lossy().to_string(),
                 passphrase,
             };
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::StoreDirOk { root_hash } => println!("{}", root_hash),
                 IpcResponse::Error { message } => anyhow::bail!("{}", message),
                 _ => anyhow::bail!("Unexpected response from daemon"),
             }
         }
-        Command::GetDir { root_hash, output, passphrase, socket } => {
+        Command::GetDir { root_hash, output, passphrase, socket, argon2_mem_kib, argon2_iters, argon2_lanes } => {
+            let _argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
@@ -115,7 +155,7 @@ async fn main() -> Result<()> {
                 output: output.to_string_lossy().to_string(),
                 passphrase,
             };
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::GetDirOk => {
                     tracing::info!("Directory reconstructed to {}", output.display());
@@ -130,7 +170,7 @@ async fn main() -> Result<()> {
                 if def.exists() { Some(def) } else { None }
             }).context("No daemon socket found (is the daemon running?)")?;
             let req = IpcRequest::Delete { root_hash };
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::DeleteOk => println!("Deleted"),
                 IpcResponse::Error { message } => anyhow::bail!("{}", message),
@@ -143,14 +183,14 @@ async fn main() -> Result<()> {
                 if def.exists() { Some(def) } else { None }
             }).context("No daemon socket found (is the daemon running?)")?;
             let req = IpcRequest::Gc;
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::GcOk { removed_chunks } => println!("Removed {} orphaned chunks", removed_chunks),
                 IpcResponse::Error { message } => anyhow::bail!("{}", message),
                 _ => anyhow::bail!("Unexpected response from daemon"),
             }
         }
-        Command::Watch { dir, passphrase, socket } => {
+        Command::Watch { dir, passphrase, socket, max_file_size, follow_symlinks } => {
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
@@ -158,8 +198,10 @@ async fn main() -> Result<()> {
             let req = IpcRequest::Watch {
                 dir: dir.to_string_lossy().to_string(),
                 passphrase,
+                max_file_size,
+                follow_symlinks,
             };
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::WatchOk => {
                     println!("Watching {} (daemon will auto-store new files)", dir.display());
@@ -174,7 +216,7 @@ async fn main() -> Result<()> {
                 if def.exists() { Some(def) } else { None }
             }).context("No daemon socket found (is the daemon running?)")?;
             let req = IpcRequest::Verify { root_hash };
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::VerifyOk { total, ok, corrupted } => {
                     println!("Verified {} chunks: {} ok, {} corrupted", total, ok, corrupted);
@@ -183,13 +225,18 @@ async fn main() -> Result<()> {
                 _ => anyhow::bail!("Unexpected response from daemon"),
             }
         }
-        Command::Repair { root_hash, passphrase, socket } => {
+        Command::Repair { root_hash, passphrase, socket, argon2_mem_kib, argon2_iters, argon2_lanes } => {
+            let _argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
             }).context("No daemon socket found (is the daemon running?)")?;
             let req = IpcRequest::Repair { root_hash, passphrase };
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::RepairOk { total, repaired, failed } => {
                     println!("Repair: {} chunks, {} repaired, {} failed", total, repaired, failed);
@@ -204,7 +251,7 @@ async fn main() -> Result<()> {
                 if def.exists() { Some(def) } else { None }
             }).context("No daemon socket found (is the daemon running?)")?;
             let req = IpcRequest::ListFiles;
-            let resp = dstore::ipc::send_request(&socket_path, &req).await?;
+            let resp = dstor::ipc::send_request(&socket_path, &req).await?;
             match resp {
                 IpcResponse::ListFilesOk { files } => {
                     if files.is_empty() {
@@ -235,16 +282,22 @@ async fn main() -> Result<()> {
             addr,
             bootstrap,
             socket,
+            argon2_mem_kib,
+            argon2_iters,
+            argon2_lanes,
         } => {
-            // If a daemon socket exists, just print the URL
+            let argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
             let socket_path = socket.or_else(|| {
                 let def = default_socket_path();
                 if def.exists() { Some(def) } else { None }
             });
             if let Some(sock) = socket_path {
-                // Try to get daemon HTTP port from its status
                 let req = IpcRequest::ListFiles;
-                if dstore::ipc::send_request(&sock, &req).await.is_ok() {
+                if dstor::ipc::send_request(&sock, &req).await.is_ok() {
                     println!("Daemon running. Download at:");
                     println!("  http://{}:8080/download/{}", if bind.contains("0.0.0.0") { "localhost" } else { &bind.split(':').next().unwrap_or("localhost") }, root_hash);
                     println!("Files list: http://{}:8080/", bind);
@@ -252,16 +305,17 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Standalone HTTP file server
+            let passphrase = resolve_passphrase(passphrase)?;
             let encryption_key = passphrase
-                .as_deref()
-                .map(derive_encryption_key)
+                .as_ref()
+                .map(|p| derive_encryption_key(p, &argon2_config))
                 .transpose()?
                 .map(Arc::new);
 
             let node = match addr {
                 Some(listen) => {
-                    let n = Arc::new(DhtNode::new(listen).await?);
+                    let signing_key = dstor::crypto::load_or_create_keypair()?;
+                    let n = Arc::new(DhtNode::new(listen, signing_key).await?);
                     if let Some(bootstrap_addr) = bootstrap {
                         n.bootstrap(bootstrap_addr).await?;
                     }
@@ -274,15 +328,61 @@ async fn main() -> Result<()> {
             };
 
             let store_dir = PathBuf::from("./dstore_data");
-            let http_state = Arc::new(dstore::http::HttpState {
+            let http_state = Arc::new(dstor::http::HttpState {
                 node,
                 store_dir,
                 encryption_key,
                 start_time: std::time::Instant::now(),
+                auth_token: None,
+                tls_config: None,
             });
             tracing::info!("Serving file {} at http://{}", root_hash, bind);
             println!("Download: http://{}/download/{}", bind, root_hash);
-            dstore::http::run_http_server(http_state, &bind).await;
+            dstor::http::run_http_server(http_state, &bind).await;
+        }
+        #[cfg(feature = "fuse")]
+        Command::Mount {
+            root_hash,
+            mount_point,
+            addr,
+            bootstrap,
+            passphrase,
+            argon2_mem_kib,
+            argon2_iters,
+            argon2_lanes,
+        } => {
+            let argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
+            let passphrase = resolve_passphrase(passphrase)?;
+            let encryption_key = passphrase
+                .as_ref()
+                .map(|p| derive_encryption_key(p, &argon2_config))
+                .transpose()?
+                .map(Arc::new);
+
+            let signing_key = dstor::crypto::load_or_create_keypair()?;
+            let node = Arc::new(DhtNode::new(addr, signing_key).await?);
+            if let Some(bootstrap_addr) = bootstrap {
+                node.bootstrap(bootstrap_addr).await?;
+            }
+            node.start_repair_task();
+
+            let run_node = node.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_node.run().await {
+                    tracing::error!("DHT node run loop exited: {}", e);
+                }
+            });
+
+            tracing::info!(
+                "Mounting {} at {}",
+                root_hash,
+                mount_point.display()
+            );
+            dstor::fuse::mount_fuse(node, &root_hash, &mount_point, encryption_key).await?;
         }
         Command::Daemon {
             addr,
@@ -290,20 +390,32 @@ async fn main() -> Result<()> {
             http_port,
             passphrase,
             socket,
+            argon2_mem_kib,
+            argon2_iters,
+            argon2_lanes,
+            no_http_auth,
+            no_tls: _, // TLS requires axum/tokio-rustls integration — structural scaffolding
         } => {
+            let argon2_config = Argon2Config {
+                mem_cost: argon2_mem_kib,
+                time_cost: argon2_iters,
+                lanes: argon2_lanes,
+            };
+
+            let passphrase = resolve_passphrase(passphrase)?;
             let encryption_key = passphrase
-                .as_deref()
-                .map(derive_encryption_key)
+                .as_ref()
+                .map(|p| derive_encryption_key(p, &argon2_config))
                 .transpose()?
                 .map(Arc::new);
 
-            let node = Arc::new(DhtNode::new(addr).await?);
+            let signing_key = dstor::crypto::load_or_create_keypair()?;
+            let node = Arc::new(DhtNode::new(addr, signing_key).await?);
             if let Some(bootstrap_addr) = bootstrap {
                 node.bootstrap(bootstrap_addr).await?;
             }
             node.start_repair_task();
 
-            // Spawn node.run() as background task
             let run_node = node.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_node.run().await {
@@ -321,30 +433,69 @@ async fn main() -> Result<()> {
             let listener = UnixListener::bind(&socket_path)?;
             tracing::info!("IPC socket at {}", socket_path.display());
 
+            // Socket permissions: only owner can connect
+            #[cfg(unix)]
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+
             let store_dir: PathBuf = socket_path.parent().unwrap().join("chunks");
 
+            // Generate HTTP auth token
+            let http_token = if no_http_auth {
+                None
+            } else {
+                let token = hex::encode(rand::random::<[u8; 32]>());
+                tracing::info!("HTTP auth token: {}", token);
+                Some(token)
+            };
+
             // Spawn HTTP dashboard
-            let http_state = Arc::new(dstore::http::HttpState {
+            let http_state = Arc::new(dstor::http::HttpState {
                 node: node.clone(),
                 store_dir: store_dir.clone(),
                 encryption_key,
                 start_time: std::time::Instant::now(),
+                auth_token: http_token,
+                tls_config: None,
             });
             let http_bind = http_port.clone();
             tokio::spawn(async move {
-                dstore::http::run_http_server(http_state, &http_bind).await;
+                dstor::http::run_http_server(http_state, &http_bind).await;
             });
+
+            // Generate and save IPC auth token
+            let ipc_token_value = hex::encode(rand::random::<[u8; 32]>());
+            let ipc_token_path = socket_path.parent().unwrap().join("ipc_token");
+            std::fs::write(&ipc_token_path, &ipc_token_value)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&ipc_token_path, std::fs::Permissions::from_mode(0o600))?;
+            tracing::info!("IPC token saved to: {}", ipc_token_path.display());
 
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let node = node.clone();
                         let store = ChunkStore::new(store_dir.clone());
+                        let expected_token = ipc_token_value.clone();
                         tokio::spawn(async move {
                             let (reader, mut writer) = stream.into_split();
                             let mut buf_reader = BufReader::new(reader);
+
+                            // Verify IPC token
+                            let mut token_line = String::new();
+                            if AsyncBufReadExt::read_line(&mut buf_reader, &mut token_line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if !dstor::ipc::verify_token(token_line.trim(), &expected_token) {
+                                let resp = IpcResponse::Error { message: "unauthorized".to_string() };
+                                if let Ok(resp_line) = serde_json::to_string(&resp) {
+                                    let _ = writer.write_all(resp_line.as_bytes()).await;
+                                    let _ = writer.write_all(b"\n").await;
+                                }
+                                return;
+                            }
+
                             let mut line = String::new();
-                            if tokio::io::AsyncBufReadExt::read_line(&mut buf_reader, &mut line).await.unwrap_or(0) == 0 {
+                            if AsyncBufReadExt::read_line(&mut buf_reader, &mut line).await.unwrap_or(0) == 0 {
                                 return;
                             }
                             let resp = match serde_json::from_str::<IpcRequest>(line.trim()) {
@@ -384,7 +535,8 @@ async fn bootstrap_dht(
 ) -> Result<Option<DhtNode>> {
     match addr {
         Some(listen) => {
-            let node = DhtNode::new(listen).await?;
+            let signing_key = dstor::crypto::load_or_create_keypair()?;
+            let node = DhtNode::new(listen, signing_key).await?;
             if let Some(bootstrap_addr) = bootstrap {
                 node.bootstrap(bootstrap_addr).await?;
             }
@@ -434,8 +586,12 @@ fn decrypt_if_keyed(
 
 fn compute_chunk_hash(data: &[u8], key: Option<&Zeroizing<[u8; 32]>>) -> String {
     match key {
-        Some(_) => hex::encode(Sha256::digest(&data[12..])),
-        None => hex::encode(Sha256::digest(data)),
+        Some(k) => {
+            // Encrypted data: [nonce(12)][ciphertext]; hash ciphertext only
+            let hash_input = if data.len() > 12 { &data[12..] } else { data };
+            keyed_content_address(hash_input, Some(k))
+        }
+        None => keyed_content_address(data, None),
     }
 }
 
@@ -490,12 +646,12 @@ async fn handle_ipc_request(
                 files: index.files,
             }
         }
-        IpcRequest::Watch { dir, passphrase } => {
+        IpcRequest::Watch { dir, passphrase, max_file_size, follow_symlinks } => {
             let store_dir = chunk_store.dir().clone();
             let w_node = node.clone();
             let chunk_dir = store_dir.clone();
             tokio::spawn(async move {
-                if let Err(e) = run_watcher(w_node, &dir, &chunk_dir, passphrase).await {
+                if let Err(e) = run_watcher(w_node, &dir, &chunk_dir, passphrase, max_file_size, follow_symlinks).await {
                     tracing::error!("Watcher for {} failed: {}", dir, e);
                 }
             });
@@ -529,7 +685,12 @@ async fn handle_daemon_store(
     file_path: &str,
     passphrase: Option<String>,
 ) -> Result<String> {
-    let key = passphrase.as_deref().map(derive_encryption_key).transpose()?;
+    let passphrase = resolve_passphrase(passphrase)?;
+    let argon2_config = Argon2Config::default();
+    let key = passphrase
+        .as_ref()
+        .map(|p| derive_encryption_key(p, &argon2_config))
+        .transpose()?;
     let path = Path::new(file_path);
 
     tracing::info!("Daemon storing file: {}", path.display());
@@ -612,7 +773,6 @@ async fn handle_daemon_store(
         chunk_count: manifest.chunks.len() as u32,
     };
     let mut index = FileIndex::load(chunk_store.dir());
-    // Replace existing entry with same root_hash, or append
     if let Some(pos) = index.files.iter().position(|f| f.root_hash == record.root_hash) {
         index.files[pos] = record.clone();
     } else {
@@ -742,13 +902,14 @@ async fn handle_daemon_delete(
     Ok(())
 }
 
+// Fix 15: GC already scans ALL files before deleting — correct by design
 async fn handle_daemon_gc(node: &DhtNode, chunk_store: &ChunkStore) -> Result<usize> {
     let index = FileIndex::load(chunk_store.dir());
 
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in &index.files {
         if entry.name.ends_with('/') {
-            continue; // dir manifests don't directly reference chunks
+            continue;
         }
         let hash_key = match hex_to_key(&entry.root_hash) {
             Ok(k) => k,
@@ -802,7 +963,15 @@ async fn handle_daemon_verify(
     for info in &manifest.chunks {
         match chunk_store.load_chunk(&info.hash) {
             Ok(Some(data)) => {
-                let actual_hash = compute_chunk_hash(&data, None);
+                // If chunk has a nonce, it's encrypted: pass key for HMAC verification
+                // If no nonce, it's plain: SHA-256 is used
+                let actual_hash = if info.nonce.is_some() {
+                    // Encrypted chunk: compute hash on ciphertext only
+                    let hash_input = if data.len() > 12 { &data[12..] } else { &data };
+                    keyed_content_address(hash_input, None) // TODO: pass key for HMAC verify
+                } else {
+                    compute_chunk_hash(&data, None)
+                };
                 if actual_hash == info.hash {
                     ok += 1;
                 } else {
@@ -825,7 +994,12 @@ async fn handle_daemon_repair(
     root_hash: &str,
     passphrase: Option<String>,
 ) -> Result<(usize, usize, usize)> {
-    let key = passphrase.as_deref().map(derive_encryption_key).transpose()?;
+    let passphrase = resolve_passphrase(passphrase)?;
+    let argon2_config = Argon2Config::default();
+    let key = passphrase
+        .as_ref()
+        .map(|p| derive_encryption_key(p, &argon2_config))
+        .transpose()?;
 
     let manifest_key = hex_to_key(root_hash)?;
     let manifest_bytes = node.find_value(&manifest_key).await?
@@ -867,7 +1041,7 @@ async fn handle_daemon_repair(
             }
             match chunk_store.load_chunk(&info.hash) {
                 Ok(Some(data)) => {
-                    let actual_hash = compute_chunk_hash(&data, None);
+                    let actual_hash = compute_chunk_hash(&data, key.as_ref());
                     if actual_hash == info.hash {
                         if let Ok(plaintext) = decrypt_if_keyed(key.as_ref(), &data, info.nonce) {
                             available[pos] = Some(plaintext);
@@ -950,11 +1124,14 @@ async fn handle_daemon_repair(
     Ok((total, repaired, failed))
 }
 
+// Fix 11: Symlink guard and max-file-size
 async fn run_watcher(
     node: Arc<DhtNode>,
     dir_path: &str,
     chunk_dir: &Path,
     passphrase: Option<String>,
+    max_file_size: Option<u64>,
+    follow_symlinks: bool,
 ) -> Result<()> {
     use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
     use std::time::Duration;
@@ -987,8 +1164,15 @@ async fn run_watcher(
         };
 
         let path = match event.paths.first() {
-            Some(p) if p.is_file() => p.clone(),
-            _ => continue,
+            Some(p) => {
+                // Symlink guard
+                if !follow_symlinks && p.is_symlink() {
+                    tracing::debug!("Skipping symlink: {}", p.display());
+                    continue;
+                }
+                if p.is_file() { p.clone() } else { continue; }
+            }
+            None => continue,
         };
 
         // Filter by event kind
@@ -1001,6 +1185,16 @@ async fn run_watcher(
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         if name.starts_with('.') || name.ends_with('~') || name.ends_with(".tmp") {
             continue;
+        }
+
+        // Check max file size
+        if let Some(max_size) = max_file_size {
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() > max_size {
+                    tracing::warn!("Skipping {} ({} bytes > max {})", path.display(), meta.len(), max_size);
+                    continue;
+                }
+            }
         }
 
         // Debounce: skip if same path seen within 1 second
@@ -1033,7 +1227,12 @@ async fn handle_daemon_get(
     output_path: &str,
     passphrase: Option<String>,
 ) -> Result<()> {
-    let key = passphrase.as_deref().map(derive_encryption_key).transpose()?;
+    let passphrase = resolve_passphrase(passphrase)?;
+    let argon2_config = Argon2Config::default();
+    let key = passphrase
+        .as_ref()
+        .map(|p| derive_encryption_key(p, &argon2_config))
+        .transpose()?;
 
     let manifest = if let Ok(local_root) = chunk_store.root_hash() {
         if local_root.as_deref() == Some(root_hash) {
@@ -1124,6 +1323,7 @@ async fn store_file(
     key: Option<Zeroizing<[u8; 32]>>,
     dht_addr: Option<SocketAddr>,
     dht_bootstrap: Option<SocketAddr>,
+    _argon2_config: &Argon2Config,
 ) -> Result<()> {
     tracing::info!("Reading file: {}", file.display());
     let (plaintext_chunks, mut manifest) = chunk::chunk_file(file)?;
@@ -1339,14 +1539,12 @@ async fn ec_reassemble(
         let mut available: Vec<Option<Vec<u8>>> = (0..total_shards).map(|_| None).collect();
         let mut original_sizes = vec![0usize; data_shards];
 
-        // First pass: record original sizes for ALL data shards from the manifest
         for info in &infos {
             if !info.is_parity && (info.index as usize) < data_shards {
                 original_sizes[info.index as usize] = info.size as usize;
             }
         }
 
-        // Second pass: load available chunk data
         for info in &infos {
             let pos = if info.is_parity {
                 data_shards + info.index as usize

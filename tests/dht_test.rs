@@ -2,10 +2,19 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use dstore::net::dht::DhtNode;
-use dstore::net::protocol::{generate_node_id, NodeId};
-use dstore::net::routing::RoutingTable;
+use dstor::net::dht::DhtNode;
+use dstor::net::protocol::NodeId;
+use dstor::net::routing::RoutingTable;
 use sha2::Digest;
+
+fn make_signing_key() -> ed25519_dalek::SigningKey {
+    let sk_bytes = rand::random::<[u8; 32]>();
+    ed25519_dalek::SigningKey::from_bytes(&sk_bytes)
+}
+
+fn random_node_id() -> NodeId {
+    rand::random()
+}
 
 fn get_local_addr() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -13,9 +22,9 @@ fn get_local_addr() -> SocketAddr {
 
 #[tokio::test]
 async fn test_bootstrap_and_lookup() {
-    let node_a = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_a = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
 
-    let node_b = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_b = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let addr_b = node_b.local_addr().unwrap();
 
     // Spawn node B in background
@@ -39,7 +48,7 @@ async fn test_bootstrap_and_lookup() {
     drop(rt_a);
 
     // Test store/find value
-    let key: NodeId = generate_node_id();
+    let key: NodeId = random_node_id();
     let value = b"hello from dstore!".to_vec();
 
     // Store via A — this should reach B
@@ -57,7 +66,7 @@ async fn test_bootstrap_and_lookup() {
 #[tokio::test]
 async fn test_store_and_retrieve_via_dht() {
     // Node B = always-on daemon
-    let node_b = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_b = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let addr_b = node_b.local_addr().unwrap();
     let b_handle = tokio::spawn(async move {
         node_b.run().await.unwrap();
@@ -65,7 +74,7 @@ async fn test_store_and_retrieve_via_dht() {
     sleep(Duration::from_millis(100)).await;
 
     // Node A = store
-    let node_a = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_a = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     node_a.bootstrap(addr_b).await.unwrap();
     sleep(Duration::from_millis(200)).await;
 
@@ -73,7 +82,7 @@ async fn test_store_and_retrieve_via_dht() {
     let file_data = b"Hello from DHT store test!".to_vec();
     let tmpfile = std::env::temp_dir().join("dht_test_store.bin");
     std::fs::write(&tmpfile, &file_data).unwrap();
-    let (chunks, manifest) = dstore::chunk::chunk_file(&tmpfile).unwrap();
+    let (chunks, manifest) = dstor::chunk::chunk_file(&tmpfile).unwrap();
     std::fs::remove_file(&tmpfile).ok();
 
     // Publish manifest
@@ -90,13 +99,13 @@ async fn test_store_and_retrieve_via_dht() {
     }
 
     // Node C = retrieve (fresh node, bootstraps with B)
-    let node_c = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_c = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     node_c.bootstrap(addr_b).await.unwrap();
     sleep(Duration::from_millis(200)).await;
 
     // Fetch manifest
     let fetched_manifest_bytes = node_c.find_value(&root_key).await.unwrap().unwrap();
-    let fetched_manifest: dstore::chunk::Manifest =
+    let fetched_manifest: dstor::chunk::Manifest =
         serde_json::from_slice(&fetched_manifest_bytes).unwrap();
 
     assert_eq!(fetched_manifest.file_name, manifest.file_name);
@@ -124,18 +133,18 @@ fn hex_to_id(hex_str: &str) -> [u8; 32] {
 
 #[tokio::test]
 async fn test_routing_table_closest() {
-    let local_id = generate_node_id();
+    let local_id = random_node_id();
     let mut rt = RoutingTable::new(local_id);
 
-    let node1_id = generate_node_id();
+    let node1_id = random_node_id();
     let node1_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
     rt.insert(node1_id, node1_addr, 0);
 
-    let node2_id = generate_node_id();
+    let node2_id = random_node_id();
     let node2_addr: SocketAddr = "127.0.0.1:8002".parse().unwrap();
     rt.insert(node2_id, node2_addr, 0);
 
-    let target = generate_node_id();
+    let target = random_node_id();
     let closest = rt.closest(&target, 2);
     assert_eq!(closest.len(), 2);
 
@@ -147,20 +156,22 @@ async fn test_routing_table_closest() {
 
 #[tokio::test]
 async fn test_external_address_discovery() {
-    let relay = DhtNode::new(get_local_addr()).await.unwrap();
+    let relay = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let relay_addr = relay.local_addr().unwrap();
     let relay_handle = tokio::spawn(async move {
         relay.run().await.unwrap();
     });
     sleep(Duration::from_millis(100)).await;
 
-    let node = DhtNode::new(get_local_addr()).await.unwrap();
+    let node = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let external = node.discover_addr(relay_addr).await.unwrap();
     assert_eq!(external, node.local_addr().unwrap(),
         "On localhost, external address should match local address");
 
+    // Single peer confirmation doesn't reach minimum vote threshold (3),
+    // so external_addr() returns None until more peers confirm.
     let stored = node.external_addr().await;
-    assert_eq!(stored, Some(external));
+    assert_eq!(stored, None, "Single peer cannot confirm external address");
 
     relay_handle.abort();
 }
@@ -168,14 +179,14 @@ async fn test_external_address_discovery() {
 #[tokio::test]
 async fn test_hole_punch_coordination() {
     // Set up three nodes: relay (R), target (T), requester (A)
-    let relay = DhtNode::new(get_local_addr()).await.unwrap();
+    let relay = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let relay_addr = relay.local_addr().unwrap();
     let relay_handle = tokio::spawn(async move {
         relay.run().await.unwrap();
     });
     sleep(Duration::from_millis(100)).await;
 
-    let target = DhtNode::new(get_local_addr()).await.unwrap();
+    let target = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let target_addr = target.local_addr().unwrap();
     let target_id = target.id;
     let target_handle = tokio::spawn(async move {
@@ -183,7 +194,7 @@ async fn test_hole_punch_coordination() {
     });
     sleep(Duration::from_millis(100)).await;
 
-    let requester = DhtNode::new(get_local_addr()).await.unwrap();
+    let requester = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
 
     // Requester asks relay to punch to target
     requester
@@ -197,25 +208,25 @@ async fn test_hole_punch_coordination() {
 
 #[tokio::test]
 async fn test_large_value_tcp_transfer() {
-    let node_b = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_b = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let addr_b = node_b.local_addr().unwrap();
     let b_handle = tokio::spawn(async move {
         node_b.run().await.unwrap();
     });
     sleep(Duration::from_millis(100)).await;
 
-    let node_a = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_a = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     node_a.bootstrap(addr_b).await.unwrap();
     sleep(Duration::from_millis(200)).await;
 
     // Create a value larger than MAX_DATAGRAM_SIZE (4096) to force TCP path
     let large_value: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
-    let key: NodeId = generate_node_id();
+    let key: NodeId = random_node_id();
 
     node_a.store_value(key, large_value.clone()).await.unwrap();
 
     // Retrieve from a fresh node C
-    let node_c = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_c = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     node_c.bootstrap(addr_b).await.unwrap();
     sleep(Duration::from_millis(200)).await;
 
@@ -228,7 +239,7 @@ async fn test_large_value_tcp_transfer() {
 #[tokio::test]
 async fn test_ec_file_store_get_over_dht() {
     // Bootstrap node
-    let bootstrap = DhtNode::new(get_local_addr()).await.unwrap();
+    let bootstrap = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     let bootstrap_addr = bootstrap.local_addr().unwrap();
     let bootstrap_handle = tokio::spawn(async move {
         bootstrap.run().await.unwrap();
@@ -241,17 +252,17 @@ async fn test_ec_file_store_get_over_dht() {
     std::fs::write(&tmpfile, &file_data).unwrap();
 
     // Node A = store the file (erasure coded, no encryption for simplicity)
-    let node_a = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_a = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     node_a.bootstrap(bootstrap_addr).await.unwrap();
     sleep(Duration::from_millis(300)).await;
 
-    let (plaintext_chunks, mut manifest) = dstore::chunk::chunk_file(&tmpfile).unwrap();
+    let (plaintext_chunks, mut manifest) = dstor::chunk::chunk_file(&tmpfile).unwrap();
     let total_data = plaintext_chunks.len();
-    let (data_shards, parity_shards) = dstore::erasure::choose_config(total_data);
+    let (data_shards, parity_shards) = dstor::erasure::choose_config(total_data);
     manifest.data_shards = data_shards;
     manifest.parity_shards = parity_shards;
 
-    let mut all_chunks: Vec<(dstore::chunk::ChunkInfo, Vec<u8>)> = Vec::new();
+    let mut all_chunks: Vec<(dstor::chunk::ChunkInfo, Vec<u8>)> = Vec::new();
 
     if parity_shards > 0 {
         let stripes = plaintext_chunks.chunks(data_shards);
@@ -260,7 +271,7 @@ async fn test_ec_file_store_get_over_dht() {
             while stripe_input.len() < data_shards {
                 stripe_input.push(vec![0u8; 0]);
             }
-            let encoded = dstore::erasure::encode_stripe(&stripe_input, parity_shards)
+            let encoded = dstor::erasure::encode_stripe(&stripe_input, parity_shards)
                 .expect("EC encode failed");
             for (shard_idx, shard_pt) in encoded.iter().enumerate() {
                 let is_parity = shard_idx >= data_shards;
@@ -272,7 +283,7 @@ async fn test_ec_file_store_get_over_dht() {
                     let s = if file_idx < total_data { manifest.chunks[file_idx].size } else { 0 };
                     (shard_idx as u32, s)
                 };
-                let info = dstore::chunk::ChunkInfo {
+                let info = dstor::chunk::ChunkInfo {
                     hash: hash.clone(),
                     index: chunk_index,
                     size: orig_size,
@@ -301,20 +312,20 @@ async fn test_ec_file_store_get_over_dht() {
     tracing::info!("Stored file root: {}", root_hash);
 
     // Node B = retrieve (fresh node, bootstraps with bootstrap)
-    let node_b = DhtNode::new(get_local_addr()).await.unwrap();
+    let node_b = DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap();
     node_b.bootstrap(bootstrap_addr).await.unwrap();
     sleep(Duration::from_millis(300)).await;
 
     // Fetch manifest from DHT
     let fetched_manifest_bytes = node_b.find_value(&root_key).await.unwrap()
         .expect("Manifest not found on DHT");
-    let fetched_manifest: dstore::chunk::Manifest =
+    let fetched_manifest: dstor::chunk::Manifest =
         serde_json::from_slice(&fetched_manifest_bytes).unwrap();
     assert_eq!(fetched_manifest.data_shards, manifest.data_shards);
     assert_eq!(fetched_manifest.total_chunks, manifest.total_chunks);
 
     // Fetch all chunks from DHT
-    let mut fetched_chunks: Vec<(dstore::chunk::ChunkInfo, Vec<u8>)> = Vec::new();
+    let mut fetched_chunks: Vec<(dstor::chunk::ChunkInfo, Vec<u8>)> = Vec::new();
     for info in &fetched_manifest.chunks {
         let key = hex_to_id(&info.hash);
         let chunk_data = node_b.find_value(&key).await.unwrap()
@@ -326,7 +337,7 @@ async fn test_ec_file_store_get_over_dht() {
     }
 
     // Reassemble using EC (replicate ec_reassemble logic)
-    let tmp_store = dstore::store::ChunkStore::new(std::env::temp_dir().join("dht_ec_test_store"));
+    let tmp_store = dstor::store::ChunkStore::new(std::env::temp_dir().join("dht_ec_test_store"));
     for (info, data) in &fetched_chunks {
         tmp_store.store_chunk(&info.hash, data).unwrap();
     }
@@ -334,7 +345,7 @@ async fn test_ec_file_store_get_over_dht() {
     let output = std::env::temp_dir().join("dht_ec_test_output.bin");
 
     // Group by stripe
-    let mut stripe_map: std::collections::HashMap<u32, Vec<&dstore::chunk::ChunkInfo>> =
+    let mut stripe_map: std::collections::HashMap<u32, Vec<&dstor::chunk::ChunkInfo>> =
         std::collections::HashMap::new();
     for info in &fetched_manifest.chunks {
         stripe_map.entry(info.stripe_index).or_default().push(info);
@@ -369,7 +380,7 @@ async fn test_ec_file_store_get_over_dht() {
         assert!(present >= data_shards as usize,
             "Stripe {}: only {}/{} shards available", stripe_idx, present, total_shards);
 
-        let reconstructed = dstore::erasure::decode_stripe(
+        let reconstructed = dstor::erasure::decode_stripe(
             &available, data_shards as usize, parity_shards as usize, &original_sizes,
         ).expect("RS reconstruction failed");
 
@@ -411,7 +422,7 @@ async fn test_ec_partial_recovery() {
     let original_sizes: Vec<usize> = data.iter().map(|d| d.len()).collect();
 
     // Encode
-    let encoded = dstore::erasure::encode_stripe(&data, parity_shards).unwrap();
+    let encoded = dstor::erasure::encode_stripe(&data, parity_shards).unwrap();
     assert_eq!(encoded.len(), data_shards + parity_shards);
 
     // Simulate 2 missing shards (indices 0 and 3)
@@ -422,7 +433,7 @@ async fn test_ec_partial_recovery() {
     available[5] = Some(encoded[5].clone()); // parity 1
 
     // Reconstruct
-    let reconstructed = dstore::erasure::decode_stripe(
+    let reconstructed = dstor::erasure::decode_stripe(
         &available, data_shards, parity_shards, &original_sizes,
     ).expect("RS recovery failed");
 
@@ -436,8 +447,8 @@ async fn test_ec_partial_recovery() {
 
 #[tokio::test]
 async fn test_node_id_generation() {
-    let id1 = generate_node_id();
-    let id2 = generate_node_id();
+    let id1 = random_node_id();
+    let id2 = random_node_id();
     assert_ne!(id1, id2, "Two generated IDs must be different");
     assert_eq!(id1.len(), 32);
     assert_eq!(id2.len(), 32);
@@ -460,7 +471,7 @@ async fn test_http_download() {
     std::fs::create_dir_all(&chunk_dir).unwrap();
 
     // Chunk the file
-    let (chunks_data, manifest) = dstore::chunk::chunk_file(&tmpfile).unwrap();
+    let (chunks_data, manifest) = dstor::chunk::chunk_file(&tmpfile).unwrap();
     let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let manifest_key = {
         let hash = sha2::Sha256::digest(&manifest_bytes);
@@ -470,15 +481,15 @@ async fn test_http_download() {
     };
 
     // Store chunks locally
-    let chunk_store = dstore::store::ChunkStore::new(chunk_dir);
+    let chunk_store = dstor::store::ChunkStore::new(chunk_dir);
     for chunk in &chunks_data {
         let hash = hex::encode(sha2::Sha256::digest(chunk));
         chunk_store.store_chunk(&hash, chunk).unwrap();
     }
 
     // Add file to index
-    let mut file_index = dstore::store::FileIndex::load(&store_dir);
-    file_index.files.push(dstore::store::FileRecord {
+    let mut file_index = dstor::store::FileIndex::load(&store_dir);
+    file_index.files.push(dstor::store::FileRecord {
         name: tmpfile.file_name().unwrap().to_string_lossy().to_string(),
         root_hash: hex::encode(manifest_key),
         size: file_data.len() as u64,
@@ -490,7 +501,7 @@ async fn test_http_download() {
     drop(chunk_store);
 
     // Create DHT node and add all keys to its store (so find_value works locally)
-    let node = Arc::new(DhtNode::new(get_local_addr()).await.unwrap());
+    let node = Arc::new(DhtNode::new(get_local_addr(), make_signing_key()).await.unwrap());
 
     // Store manifest in DHT
     node.store_value(manifest_key, manifest_bytes).await.unwrap();
@@ -504,11 +515,13 @@ async fn test_http_download() {
     }
 
     // Start HTTP server on random port
-    let http_state = Arc::new(dstore::http::HttpState {
+    let http_state = Arc::new(dstor::http::HttpState {
         node: node.clone(),
         store_dir: store_dir.clone(),
         encryption_key: None,
         start_time: std::time::Instant::now(),
+        auth_token: None,
+        tls_config: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_addr = listener.local_addr().unwrap();
@@ -517,7 +530,7 @@ async fn test_http_download() {
     // Accept one connection and delegate to handle_connection
     let accept_handle = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        dstore::http::handle_connection(&mut stream, state_clone).await.ok();
+        dstor::http::handle_connection(&mut stream, state_clone).await.ok();
     });
 
     sleep(Duration::from_millis(100)).await;

@@ -2,7 +2,9 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
 };
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub struct EncryptedChunk {
@@ -28,4 +30,21 @@ pub fn decrypt_chunk(key: &Zeroizing<[u8; 32]>, enc: &EncryptedChunk) -> Option<
     let cipher = ChaCha20Poly1305::new(key.as_ref().into());
     let nonce = Nonce::from(enc.nonce);
     cipher.decrypt(&nonce, enc.ciphertext.as_ref()).ok()
+}
+
+pub fn keyed_content_address(data: &[u8], key: Option<&Zeroizing<[u8; 32]>>) -> String {
+    match key {
+        Some(k) => {
+            let mut mac: Hmac<Sha256> =
+                Mac::new_from_slice(k.as_ref()).expect("HMAC key");
+            mac.update(data);
+            hex::encode(mac.finalize().into_bytes())
+        }
+        None => hex::encode(Sha256::digest(data)),
+    }
+}
+
+pub fn zeroize_buf(buf: &mut Vec<u8>) {
+    buf.fill(0);
+    buf.clear();
 }

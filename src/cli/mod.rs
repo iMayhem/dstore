@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 fn passphrase_help() -> &'static str {
-    "Encryption passphrase (also read from DSECRET env var). Omit for no encryption."
+    "Encryption passphrase (also read from DSTORE_PASSPHRASE env var or DSTORE_PASSPHRASE_FILE path). Omit for no encryption."
 }
 
 fn socket_help() -> &'static str {
@@ -27,7 +27,7 @@ pub enum Command {
         #[arg(short, long, default_value = "./dstore_data")]
         out: PathBuf,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// DHT listen address (optional; omit for local-only)
         #[arg(short, long)]
@@ -38,6 +38,15 @@ pub enum Command {
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// Reassemble a file from local encrypted chunks or fetch from DHT
     Get {
@@ -50,7 +59,7 @@ pub enum Command {
         #[arg(short, long, default_value = "./dstore_data")]
         store: Option<PathBuf>,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// DHT listen address (optional; omit for local-only)
         #[arg(short, long)]
@@ -61,17 +70,35 @@ pub enum Command {
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// Store an entire directory recursively
     StoreDir {
         /// Path to the directory to store
         dir: PathBuf,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// Retrieve a stored directory
     GetDir {
@@ -81,11 +108,20 @@ pub enum Command {
         #[arg(short, long)]
         output: PathBuf,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// Delete a file from the local store and file index
     Delete {
@@ -106,11 +142,17 @@ pub enum Command {
         /// Path to the directory to watch
         dir: PathBuf,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Maximum file size in bytes to auto-store (default: no limit)
+        #[arg(long)]
+        max_file_size: Option<u64>,
+        /// Follow symlinks (default: reject)
+        #[arg(long)]
+        follow_symlinks: bool,
     },
     /// Verify integrity of all chunks for a stored file
     Verify {
@@ -125,11 +167,20 @@ pub enum Command {
         /// Root hash of the file to repair
         root_hash: String,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// Serve a stored file via HTTP (starts a file server)
     Serve {
@@ -139,7 +190,7 @@ pub enum Command {
         #[arg(long, default_value = "127.0.0.1:8080")]
         bind: String,
         /// Encryption passphrase
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// DHT listen address (optional; omit for local-only)
         #[arg(short, long)]
@@ -150,12 +201,48 @@ pub enum Command {
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// List files stored on the daemon
     List {
         /// Connect to a running daemon via Unix socket
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+    },
+    /// Mount a stored file via FUSE (requires libfuse3-dev at build time)
+    #[cfg(feature = "fuse")]
+    Mount {
+        /// Root hash of the file to mount
+        root_hash: String,
+        /// Mount point directory
+        #[arg(short, long)]
+        mount_point: PathBuf,
+        /// DHT listen address
+        #[arg(short, long)]
+        addr: SocketAddr,
+        /// DHT bootstrap node address
+        #[arg(short, long)]
+        bootstrap: Option<SocketAddr>,
+        /// Encryption passphrase
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
+        passphrase: Option<String>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
     },
     /// Start a DHT node (daemon mode)
     Daemon {
@@ -169,10 +256,25 @@ pub enum Command {
         #[arg(long, default_value = "127.0.0.1:8080")]
         http_port: String,
         /// Encryption passphrase (required for HTTP download of encrypted files)
-        #[arg(short, long, env = "DSECRET", help = passphrase_help())]
+        #[arg(short, long, env = "DSTORE_PASSPHRASE", help = passphrase_help())]
         passphrase: Option<String>,
         /// Unix socket path for IPC (default: ~/.dstore/daemon.sock)
         #[arg(short = 'S', long, help = socket_help())]
         socket: Option<PathBuf>,
+        /// Argon2 memory cost in KiB (default: 192)
+        #[arg(long, default_value = "192")]
+        argon2_mem_kib: u32,
+        /// Argon2 time cost (iterations, default: 2)
+        #[arg(long, default_value = "2")]
+        argon2_iters: u32,
+        /// Argon2 parallelism (lanes, default: 1)
+        #[arg(long, default_value = "1")]
+        argon2_lanes: u32,
+        /// Disable HTTP auth token (not recommended)
+        #[arg(long)]
+        no_http_auth: bool,
+        /// Disable TLS (not recommended)
+        #[arg(long)]
+        no_tls: bool,
     },
 }
