@@ -1,0 +1,45 @@
+services:
+  node1:
+    build: .
+    container_name: dstore-node1
+    ports:
+      - "10001:10001/udp"
+      - "10002:10002"
+      - "8081:8080"
+    volumes:
+      - dstore-node1:/root/.dstore
+    command: >
+      daemon --addr 0.0.0.0:10001 --http-port 0.0.0.0:8080
+
+  node2:
+    build: .
+    container_name: dstore-node2
+    ports:
+      - "20001:20001/udp"
+      - "20002:20002"
+      - "8082:8080"
+    volumes:
+      - dstore-node2:/root/.dstore
+    depends_on:
+      - node1
+    command: >
+      daemon --addr 0.0.0.0:20001 --bootstrap node1:10001 --http-port 0.0.0.0:8080
+
+  node3:
+    build: .
+    container_name: dstore-node3
+    ports:
+      - "30001:30001/udp"
+      - "30002:30002"
+      - "8083:8080"
+    volumes:
+      - dstore-node3:/root/.dstore
+    depends_on:
+      - node1
+    command: >
+      daemon --addr 0.0.0.0:30001 --bootstrap node1:10001 --http-port 0.0.0.0:8080
+
+volumes:
+  dstore-node1:
+  dstore-node2:
+  dstore-node3:

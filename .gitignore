@@ -1,0 +1,8 @@
+/target
+.dstore_data
+dstore_data
+*.chunk
+files.json
+node_key
+*.sock
+.env

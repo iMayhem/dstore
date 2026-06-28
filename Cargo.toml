@@ -1,0 +1,28 @@
+[package]
+name = "dstore"
+version = "0.1.0"
+edition = "2021"
+description = "Decentralized file storage over Kademlia DHT with erasure coding, encryption, and NAT traversal"
+license = "MIT"
+repository = "https://github.com/iMayhem/dstore"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+hex = "0.4"
+serde_json = "1"
+rand = "0.8"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+ed25519-dalek = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+dirs = "5"
+reed-solomon-erasure = "6.0"
+inotify = "0.10"
+# fuser requires libfuse3-dev (system package) — falls back to HTTP file serving
